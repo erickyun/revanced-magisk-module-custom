@@ -25,7 +25,7 @@ toml_get_table_names() {
 	fi
 	echo "$tn"
 }
-toml_get_table() { sed -n "/\[${1}]/,/^\[.*]$/p" <<<"$__TOML__" | sed '/^\[/d'; }
+toml_get_table() { sed -n "/\[${1}]/,/^\[.*]$/p" <<<"$__TOML__" | sed '${/^\[/d;}'; }
 toml_get() {
 	local table=$1 key=$2 val
 	val=$(grep -m 1 "^${key}=" <<<"$table") && sed -e "s/^\"//; s/\"$//" <<<"${val#*=}"
@@ -293,12 +293,24 @@ dl_apkmonk() {
 }
 get_apkmonk_pkg_name() { grep -oP '.*apkmonk\.com\/app\/\K([,\w,\.]*)' <<<"$1"; }
 # --------------------------------------------------
+dl_archive() {
+	local archive_resp=$1 version=$2 arch=$3 output=$4 url=$5
+	local path
+	path=$(grep "${version}-${arch}" <<<"$archive_resp") || return 1
+	req "${url}/${path}" "$output"
+}
+get_archive_resp() {
+	r=$(req "$1" -)
+	if [ -z "$r" ]; then return 1; else sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r"; fi
+}
+get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.apk//g' <<<"$1"; }
+get_archive_pkg_name() { head -1 <<<"$1" | cut -d- -f1; }
+# --------------------------------------------------
 
 patch_apk() {
-	local stock_input=$1 patched_apk=$2 patcher_args=$3 rv_cli_jar=$4 rv_patches_jar=$5 riplib=$6
+	local stock_input=$1 patched_apk=$2 patcher_args=$3 rv_cli_jar=$4 rv_patches_jar=$5
 	declare -r tdir=$(mktemp -d -p $TEMP_DIR)
 	local cmd="java -jar $rv_cli_jar patch $stock_input -r $tdir -p -o $patched_apk -b $rv_patches_jar --keystore=ks.keystore $patcher_args"
-	if [ "$riplib" = true ]; then cmd+=" --rip-lib x86_64 --rip-lib x86"; fi
 	if [ "$OS" = Android ]; then cmd+=" --custom-aapt2-binary=${TEMP_DIR}/aapt2"; fi
 	pr "$cmd"
 	if [ "${DRYRUN:-}" = true ]; then
@@ -325,7 +337,13 @@ build_rv() {
 	p_patcher_args+=("$(join_args "${args[excluded_patches]}" -e) $(join_args "${args[included_patches]}" -i)")
 	[ "${args[exclusive_patches]}" = true ] && p_patcher_args+=("--exclusive")
 
-	if [ "$dl_from" = apkmirror ]; then
+	if [ "$dl_from" = archive ]; then
+		if ! archive_resp=$(get_archive_resp "${args[archive_dlurl]}"); then
+			epr "Could not find ${args[archive_dlurl]}"
+			return 0
+		fi
+		pkg_name=$(get_archive_pkg_name "$archive_resp")
+	elif [ "$dl_from" = apkmirror ]; then
 		pkg_name=$(get_apkmirror_pkg_name "${args[apkmirror_dlurl]}")
 	elif [ "$dl_from" = uptodown ]; then
 		uptwod_resp_dl=$(req "${args[uptodown_dlurl]}/download" -)
@@ -350,7 +368,10 @@ build_rv() {
 		p_patcher_args+=("-f")
 	fi
 	if [ $get_latest_ver = true ]; then
-		if [ "$dl_from" = apkmirror ]; then
+		if [ "$dl_from" = archive ]; then
+			archivevers=$(get_archive_vers "$archive_resp")
+			version=$(get_largest_ver <<<"$archivevers") || version=$(head -1 <<<"$archivevers")
+		elif [ "$dl_from" = apkmirror ]; then
 			local apkmvers aav
 			if [ "$version_mode" = beta ]; then aav="true"; else aav="false"; fi
 			apkmvers=$(get_apkmirror_vers "${args[apkmirror_dlurl]##*/}" "$aav")
@@ -372,8 +393,16 @@ build_rv() {
 	version_f=${version_f#v}
 	local stock_apk="${TEMP_DIR}/${pkg_name}-${version_f}-${arch_f}.apk"
 	if [ ! -f "$stock_apk" ]; then
-		for dl_p in apkmirror uptodown apkmonk; do
-			if [ "$dl_p" = apkmirror ]; then
+		for dl_p in archive apkmirror uptodown apkmonk; do
+			if [ "$dl_p" = archive ]; then
+				if [ -z "${args[archive_dlurl]}" ]; then continue; fi
+				pr "Downloading '${table}' from j-hc archive"
+				if ! dl_archive "$archive_resp" "$version_f" "$arch_f" "$stock_apk" "${args[archive_dlurl]}"; then
+					epr "ERROR: Could not download ${table} from j-hc archive"
+					continue
+				fi
+				break
+			elif [ "$dl_p" = apkmirror ]; then
 				if [ -z "${args[apkmirror_dlurl]}" ]; then continue; fi
 				pr "Downloading '${table}' from APKMirror"
 				local apkm_arch
@@ -451,6 +480,14 @@ build_rv() {
 	# 	fi
 	# fi
 
+	if [ "${args[riplib]}" = true ]; then
+		p_patcher_args+=("--rip-lib x86_64 --rip-lib x86")
+		if [ "$arch" = "arm64-v8a" ]; then
+			p_patcher_args+=("--rip-lib armeabi-v7a")
+		elif [ "$arch" = "arm-v7a" ]; then
+			p_patcher_args+=("--rip-lib arm64-v8a")
+		fi
+	fi
 	if [ "$mode_arg" = module ]; then
 		build_mode_arr=(module)
 	elif [ "$mode_arg" = apk ]; then
@@ -474,14 +511,11 @@ build_rv() {
 		else
 			patched_apk="${TEMP_DIR}/${app_name_l}-${rv_brand_f}-${version_f}-${arch_f}.apk"
 		fi
-		if [ "$build_mode" = module ]; then
-			if [ "${args[riplib]}" = true ]; then patcher_args+=("--unsigned"); fi
-			if [ "${args[riplib]}" = true ] && { [ $is_bundle = false ] || [ "${args[include_stock]}" = false ]; }; then
-				patcher_args+=("--rip-lib arm64-v8a --rip-lib armeabi-v7a")
-			fi
+		if [ "$build_mode" = module ] && [ "${args[riplib]}" = true ]; then
+			patcher_args+=("--unsigned --rip-lib arm64-v8a --rip-lib armeabi-v7a")
 		fi
 		if [ ! -f "$patched_apk" ] || [ "$REBUILD" = true ]; then
-			if ! patch_apk "$stock_apk" "$patched_apk" "${patcher_args[*]}" "${args[cli]}" "${args[ptjar]}" "${args[riplib]}"; then
+			if ! patch_apk "$stock_apk" "$patched_apk" "${patcher_args[*]}" "${args[cli]}" "${args[ptjar]}"; then
 				epr "Building '${table}' failed!"
 				return 0
 			fi
